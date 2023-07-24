@@ -72,3 +72,21 @@ parser.add_argument('--mode',type=str,default='None',
 
 args = parser.parse_args()
 
+cudnn.benchmark=True 
+
+def main(rank,args) : 
+    init_process(rank,args.world_size)
+    
+    if dist.get_rank() ==0:
+        wandb.init(project = 'vision transformer',
+                  )
+        wandb.config.update(args)                             
+    else : 
+        wandb.init(project = 'vision transformer',
+                   mode = 'disabled')
+        wandb.config.update(args)
+    
+    st = time.time()
+    train_dir = os.path.join(args.data_path,'train')
+    test_dir = os.path.join(args.data_path,'val')
+
