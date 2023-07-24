@@ -87,6 +87,18 @@ def main(rank,args) :
         wandb.config.update(args)
     
     st = time.time()
-    train_dir = os.path.join(args.data_path,'train')
-    test_dir = os.path.join(args.data_path,'val')
+
+if dist.get_rank() == 0 : 
+        print('data load',time.time()-st)
+    
+    args.batch_size = int(args.batch_size / args.world_size)
+    args.workers = int((args.workers + args.world_size - 1) / args.world_size)
+    
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_data,
+                                                                    rank=rank,
+                                                                    num_replicas=args.world_size,
+                                                                    shuffle=True)
+    
+    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True,sampler=train_sampler)
+    val_loader = DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=False)
 
