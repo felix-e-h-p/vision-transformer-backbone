@@ -122,6 +122,7 @@ class ViT(nn.Sequential):
                 depth: int = 12,
                 n_classes: int = 1000,
                 **kwargs):
+                  
         super().__init__(PatchEmbedding(in_channels,
                                         patch_size,
                                         emb_size,
