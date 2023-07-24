@@ -5,6 +5,7 @@ import argparse
 import time  
 import utils
 import config
+import os
 import torch.nn as nn
 import torchvision
 import torch.nn.functional as F
@@ -12,15 +13,14 @@ import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from metrics import accuracy 
 import models
+
 from model import ViT
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
 from scheduler import WarmupCosineSchedule
 from torchvision import datasets, transforms
 from dataloader import ImageFolder
 from torch.utils.data import DataLoader
-import os
 
 def accuracy(output, target, topk=(1,)):
     with torch.no_grad():
@@ -99,6 +99,175 @@ if dist.get_rank() == 0 :
                                                                     num_replicas=args.world_size,
                                                                     shuffle=True)
     
-    train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True,sampler=train_sampler)
-    val_loader = DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=False)
+    train_loader = DataLoader(train_data, 
+                              batch_size=args.batch_size, 
+                              shuffle=False, 
+                              num_workers=args.workers, 
+                              pin_memory=True,
+                              sampler=train_sampler)
 
+    val_loader = DataLoader(val_data, 
+                            batch_size=args.batch_size, 
+                            shuffle=False, 
+                            num_workers=args.workers, 
+                            pin_memory=False)
+    model = ViT(in_channels = 3,
+                patch_size = 16,
+                emb_size = 768,
+                img_size = 224,
+                depth = 12,
+                n_classes = 1000)
+
+    torch.cuda.set_device(rank)
+
+    if args.mode == 'train':
+        
+        model = model.cuda(rank)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
+
+        wandb.watch(model)
+
+        optimiser = optim.Adam(model.parameters(),
+                               lr=args.lr,
+                               weight_decay=args.weight_decay)
+
+        t_total = ( len(train_loader.dataset) / args.batch_size ) * args.epochs  
+        print(f"total_step : {t_total}")
+
+        scheduler = CosineAnnealingLR(optimiser,
+                                      T_max=args.t_max,
+                                      eta_min=0)
+        
+        criterion = nn.CrossEntropyLoss().cuda(rank)
+        
+        max_norm = 1 
+
+        scaler = torch.cuda.amp.GradScaler()
+
+        model.train()
+        
+        for epoch in range(args.epochs):
+            train_sampler.set_epoch(epoch)
+            
+            for batch_idx, (data, target) in enumerate(train_loader):
+                st = time.time()
+                data, target = data.cuda(dist.get_rank()), target.cuda(dist.get_rank())
+                optimizer.zero_grad()
+                
+                with torch.cuda.amp.autocast():
+                    output = model(data)
+                    loss = criterion(output,target) 
+                    
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm)
+                acc1, acc5 = accuracy(output, target, topk=(1, 5))
+                scaler.step(optimizer)
+                scaler.update() 
+                scheduler.step()  #iter
+                train_loss = reduce_tensor(loss.data,dist.get_world_size())
+
+                if dist.get_rank() == 0 : 
+                    wandb.log({'train_batch_loss' : train_loss.item()})
+                    print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                        epoch, batch_idx * len(data), int(len(train_loader.dataset)/args.world_size),
+                        100. * batch_idx / len(train_loader), train_loss))
+                    print('teacher_network iter time is {0}s'.format(time.time()-st))
+            
+            if dist.get_rank() == 0 :
+                print('save checkpoint') 
+
+                if epoch % 15 == 0:
+                    save_checkpoint({
+                        'epoch': epoch + 1,
+                        'state_dict': model.state_dict(),
+                        'optimizer' : optimizer.state_dict()
+                    },filename=f'checkpoint_{epoch}.pth.tar') 
+            
+            model.eval()
+            correct = 0
+            total_acc1 = 0
+            total_acc5 = 0
+            step=0
+            st = time.time()
+            
+            for batch_idx,(data, target) in enumerate(val_loader) :
+                
+                with torch.no_grad() :
+                    data, target = data.cuda(dist.get_rank()), target.cuda(dist.get_rank())
+                    output = model(data)
+                val_loss = criterion(output,target) 
+                val_loss = reduce_tensor(val_loss.data,dist.get_world_size())
+                
+                if dist.get_rank() == 0 :             
+                        wandb.log({'val_batch_loss' : val_loss.item()})
+
+                acc1, acc5 = accuracy(output, target, topk=(1, 5))
+                total_acc1 += acc1[0] 
+                total_acc5 += acc5[0]
+                step+=1
+                
+            if dist.get_rank() == 0 :    
+                print(f"[{batch_idx * len(data)}/{int(len(val_loader.dataset)/args.world_size)}, top1-acc : {acc1[0]}, top5-acc : {acc5[0]}]")
+
+            if dist.get_rank() == 0 :
+                print('\nval set: top1: {}, top5 : {} '.format(total_acc1/step, total_acc5/step))
+                wandb.log({'top1' : total_acc1/step})
+                wandb.log({'top5' : total_acc5/step})
+            print(f"validation time : {time.time()-st}")
+
+            if args.mode == 'val' : 
+                checkpoint = torch.load('ckpt path')
+                model = model.cuda(rank)
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
+                model.load_state_dict(checkpoint['state_dict'])
+
+                optimiser = optim.Adam(model.parameters(),
+                                       lr=args.lr,
+                                       weight_decay=args.weight_decay) 
+                optimizer.load_state_dict(checkpoint['optimizer'])
+
+                criterion = nn.CrossEntropyLoss().cuda(rank) 
+    
+                model.eval()
+                correct = 0
+                total_acc1 = 0
+                total_acc5 = 0
+
+                st = time.time()
+                for batch_idx,(data, target) in enumerate(val_loader) :
+                    with torch.no_grad() :
+                        data, target = data.cuda(dist.get_rank()), target.cuda(dist.get_rank())
+                        output = model(data)
+                    val_loss = criterion(output,target) 
+                    val_loss = reduce_tensor(val_loss.data,dist.get_world_size())
+                    acc1, acc5 = accuracy(output, target, topk=(1, 5))
+                    total_acc1 += acc1[0] 
+                    total_acc5 += acc5[0]
+
+                if dist.get_rank() == 0 :     
+                    print(f"[{batch_idx * len(data)}/{int(len(val_loader.dataset)/args.world_size)}, top1-acc : {acc1[0]}, top5-acc : {acc5[0]}]")
+            
+                if dist.get_rank() == 0 :
+                    print('\nval set: top1: {}, top5 : {} '.format(
+                            experiment.log_metric(torch.mean(total_acc1)), experiment.log_metric(torch.mean(total_acc5))))
+        
+                print(f"validation time : {time.time()-st}")
+    
+            cleanup()
+            wandb.finish()
+
+def reduce_tensor(tensor, world_size): 
+    
+    rt = tensor.clone()
+    dist.all_reduce(rt, op = dist.ReduceOp.SUM)
+    rt /= world_size
+    return rt
+
+def save_checkpoint(state, filename='checkpoint.pth.tar'):
+    
+    torch.save(state, filename)
+
+if __name__ == '__main__':  
+    
+   mp.spawn(main, nprocs = args.world_size, args = (args,))
