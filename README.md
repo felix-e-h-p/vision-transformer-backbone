@@ -19,8 +19,9 @@ To train the ViT model, run the following command:
 
 ```bash
 python train.py --world_size <num_gpus> --mode train
-
+```
 ### Validation
 
 ```bash
 python train.py --world_size <num_gpus> --mode val
+```
